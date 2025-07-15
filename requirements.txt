@@ -1,0 +1,12 @@
+# requirements.txt
+flwr[simulation]
+torch
+torchvision
+torchaudio
+pandas
+pyarrow          # For reading .parquet files
+scikit-learn
+numpy
+Pillow
+matplotlib       # For visualization
+tqdm
