@@ -1,23 +1,25 @@
 import os
 import re
+import copy
 import json
 import numpy as np
 import pandas as pd
+from tqdm import tqdm
+from datetime import datetime
+import matplotlib.pyplot as plt
+
 import torch
 import torch.nn as nn
+import torch.optim as optim
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
+from torch.cuda.amp import autocast, GradScaler
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import f1_score, accuracy_score, confusion_matrix, classification_report
-import matplotlib.pyplot as plt
-from datetime import datetime
-from tqdm import tqdm
-import torch.optim as optim
-from torch.utils.data import WeightedRandomSampler
 
 # 禁用不必要的警告
 import warnings
-
 warnings.filterwarnings('ignore')
 
 # 配置信息
@@ -93,9 +95,52 @@ CONFIG = {
     "use_sigmoid": True          # 是否使用Sigmoid
 }
 
+# 在CONFIG中新增特征维度
+CONFIG.update({
+    "au_feature_dim": 32,  # 17个AU的强度+出现频率
+    "eye_feature_dim": 2,  # 眨眼率/注视比等
+    "pose_feature_dim": 6,  # 头部角度/运动幅度
+})
+
+os.makedirs(CONFIG["model_save_dir"], exist_ok=True
 # 创建缓存目录
 if not os.path.exists(CONFIG["cache_dir"]):
-    os.makedirs(CONFIG["cache_dir"])
+    os.makedirs(CONFIG["cache_dir"]))
+
+def read_video_txt(file_path):
+        return pd.DataFrame()
+    
+# 辅助函数: 重新排列张量维度
+def rearrange(tensor, pattern, **axes_lengths):
+    """扩展张量重组函数以支持多头注意力需要的模式"""
+    # 已有模式保持不变
+    if pattern == 'b t1 (t2 w) -> (b t1) t2 w':
+        b, t1, rest = tensor.shape
+        t2 = axes_lengths['t2']
+        w = rest // t2
+        return tensor.reshape(b * t1, t2, w)
+
+    elif pattern == '(b t) c -> b t c':
+        bt, c = tensor.shape
+        t = axes_lengths['t']
+        b = bt // t
+        return tensor.reshape(b, t, c)
+
+    # 新增以下两种模式以支持多头注意力
+    # 模式: b n (h d) -> b h n d
+    elif pattern == 'b n (h d) -> b h n d':
+        b, n, hid_dim = tensor.shape
+        h = axes_lengths['h']
+        d = hid_dim // h
+        return tensor.reshape(b, n, h, d).permute(0, 2, 1, 3)
+
+    # 模式: b h n d -> b n (h d)
+    elif pattern == 'b h n d -> b n (h d)':
+        b, h, n, d = tensor.shape
+        return tensor.permute(0, 2, 1, 3).reshape(b, n, h * d)
+
+    else:
+        raise ValueError(f"不支持的pattern: {pattern}")
 
 
 # 抑郁症专用Transformer编码器
@@ -160,7 +205,6 @@ class DepressionTransformer(nn.Module):
         position_embeddings[:, 1::2] = torch.cos(position * div_term)
 
         return position_embeddings
-
 
 # 从models.py导入的模型类
 class video_BiLSTM_fea(nn.Module):
@@ -263,12 +307,6 @@ class audio_BiLSTM_Fea(nn.Module):
         out = self.fc_t1(out)
 
         return out
-
-
-import torch
-from torch import nn
-
-
 
 class MIL_Text_Video_Audio_M3(nn.Module):
     """多模态融合模型 (文本+视频+音频)"""
@@ -517,39 +555,6 @@ class EnhancedMILModel(MIL_Text_Video_Audio_M3):
         # 分类
         output = self.classifier(multimodal_feature)
         return output, {"video_attention": attention_weights.squeeze(-1)}
-
-# 辅助函数: 重新排列张量维度
-def rearrange(tensor, pattern, **axes_lengths):
-    """扩展张量重组函数以支持多头注意力需要的模式"""
-    # 已有模式保持不变
-    if pattern == 'b t1 (t2 w) -> (b t1) t2 w':
-        b, t1, rest = tensor.shape
-        t2 = axes_lengths['t2']
-        w = rest // t2
-        return tensor.reshape(b * t1, t2, w)
-
-    elif pattern == '(b t) c -> b t c':
-        bt, c = tensor.shape
-        t = axes_lengths['t']
-        b = bt // t
-        return tensor.reshape(b, t, c)
-
-    # 新增以下两种模式以支持多头注意力
-    # 模式: b n (h d) -> b h n d
-    elif pattern == 'b n (h d) -> b h n d':
-        b, n, hid_dim = tensor.shape
-        h = axes_lengths['h']
-        d = hid_dim // h
-        return tensor.reshape(b, n, h, d).permute(0, 2, 1, 3)
-
-    # 模式: b h n d -> b n (h d)
-    elif pattern == 'b h n d -> b n (h d)':
-        b, h, n, d = tensor.shape
-        return tensor.permute(0, 2, 1, 3).reshape(b, n, h * d)
-
-    else:
-        raise ValueError(f"不支持的pattern: {pattern}")
-
 
 # DSM-5症状分析器
 class DSM5Analyzer:
@@ -844,73 +849,6 @@ class AudioProcessor:
         except Exception as e:
             print(f"处理音频特征失败: {e}")
             return np.zeros(CONFIG["audio_feature_dim"])
-
-
-# 在CONFIG中新增特征维度
-CONFIG.update({
-    "au_feature_dim": 32,  # 17个AU的强度+出现频率
-    "eye_feature_dim": 2,  # 眨眼率/注视比等
-    "pose_feature_dim": 6,  # 头部角度/运动幅度
-})
-
-
-# 在EnhancedVideoProcessor类定义之前添加
-def read_video_txt(file_path):
-    import pandas as pd
-    import numpy as np
-
-    try:
-        # 先读取第一行并去掉前后空格
-        with open(file_path, 'r', encoding='utf-8') as f:
-            first_line = f.readline().strip()
-    except Exception as e:
-        print(f"无法读取文件第一行: {e}")
-        return pd.DataFrame()
-
-    # 定义分隔符
-    if '\t' in first_line:
-        sep = '\t'
-    elif ',' in first_line:
-        sep = ','
-    else:
-        sep = None
-
-    # 判断 header 是否存在，增加容错处理
-    if first_line and any(char.isalpha() for char in first_line.replace(' ', '').replace(',', '')):
-        header = 0
-    else:
-        header = None
-
-    try:
-        df = pd.read_csv(
-            file_path,
-            sep=sep,
-            header=header,
-            na_values=['-1.#IND', 'NaN', 'nan', 'NAN', 'Inf', '-Inf', 'inf', '-inf'],
-            engine='c',
-            low_memory=False,
-            on_bad_lines='skip'
-        )
-
-        # 检查列名是否可用
-        if df.empty:
-            return pd.DataFrame()
-
-        # 如果是数字列名（即未读到 header），则手动设置列名
-        if df.columns[0] in (0, '0'):  # 检查是否为默认索引列名
-            df.columns = [f'col_{i}' for i in range(df.shape[1])]
-
-        # 统一列名格式
-        df.columns = [col.strip().replace(' ', '_').replace(',', '').lower() for col in df.columns]
-
-        df.replace([np.inf, -np.inf], np.nan, inplace=True)
-        df.fillna(0, inplace=True)
-        return df
-
-    except Exception as e:
-        print(f"读取视频 TXT 文件失败: {e}")
-        return pd.DataFrame()
-
 
 # 增强的视频处理器
 class EnhancedVideoProcessor(VideoProcessor):
@@ -1216,6 +1154,7 @@ class DAICWOZDataset(Dataset):
             'audio': torch.FloatTensor(item["audio"]),  # 音频特征：(16, 768)
             'label': torch.tensor(item["label"], dtype=torch.long)  # 整数标签：0或1
         }
+        
 # 平衡损失类
 class BalancedBCELoss(nn.Module):
     def __init__(self, beta=0.9, eps=1e-5, pos_weight=None):
@@ -1246,18 +1185,6 @@ class BalancedBCELoss(nn.Module):
             reduction='mean'
         )
 
-
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, WeightedRandomSampler
-from tqdm import tqdm
-import numpy as np
-import os
-import copy
-from sklearn.metrics import accuracy_score, f1_score
-
-
 # 自定义稳定损失函数
 class StableBCELoss(nn.Module):
     """数值稳定的二进制交叉熵损失，特别处理极端输入值"""
@@ -1283,8 +1210,6 @@ class StableBCELoss(nn.Module):
         loss_elementwise = - (pos_loss + neg_loss)
         return loss_elementwise.mean()
 
-# 3. 修复训练过程梯度问题
-from torch.cuda.amp import autocast, GradScaler
 # 完整的训练函数
 def train_model(model, train_loader, val_loader, epochs=100, lr=0.001, patience=5):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -1519,3 +1444,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
