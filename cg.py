@@ -1339,9 +1339,6 @@ def evaluate_model(model, data_loader, device):
     f1 = f1_score(all_labels, all_preds, zero_division=0)
     return avg_loss, accuracy, f1
 
-# 在 main() 函数顶部添加：
-os.makedirs(CONFIG["model_save_dir"], exist_ok=True)
-
 # 主函数
 def main():
     # 加载训练数据
